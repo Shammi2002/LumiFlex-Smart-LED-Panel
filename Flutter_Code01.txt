@@ -1,0 +1,217 @@
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:web_socket_channel/web_socket_channel.dart';
+
+void main() => runApp(const LumiFlexApp());
+
+// ===== Use mDNS hostname instead of hardcoded IP =====
+const String espHost = "esp32.local";
+
+class LumiFlexApp extends StatelessWidget {
+  const LumiFlexApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: FutureBuilder<bool>(
+        future: _checkESPReachable(),
+        builder: (context, snapshot) {
+          if (!snapshot.hasData) {
+            return const Scaffold(
+              body: Center(child: CircularProgressIndicator()),
+            );
+          }
+          return snapshot.data! ? const LedControlPage() : const WifiSetupPage();
+        },
+      ),
+    );
+  }
+
+  Future<bool> _checkESPReachable() async {
+    try {
+      final res = await http.get(Uri.http(espHost, "/status")).timeout(const Duration(seconds: 3));
+      return res.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+}
+
+// ================= LED CONTROL PAGE =================
+class LedControlPage extends StatefulWidget {
+  const LedControlPage({super.key});
+
+  @override
+  State<LedControlPage> createState() => _LedControlPageState();
+}
+
+class _LedControlPageState extends State<LedControlPage> {
+  late WebSocketChannel _channel;
+  Timer? _statusTimer;
+
+  bool power = true;
+  double brightness = 1.0;
+  double colorTemp = 0.5;
+  bool connected = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _connectWebSocket();
+    _startStatusPolling();
+  }
+
+  void _connectWebSocket() {
+    _channel = WebSocketChannel.connect(
+      Uri.parse("ws://$espHost:8080/ws"),
+    );
+  }
+
+  void _startStatusPolling() {
+    _statusTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
+      try {
+        final res = await http.get(Uri.http(espHost, "/status"));
+        if (res.statusCode == 200) {
+          setState(() => connected = true);
+        } else {
+          setState(() => connected = false);
+        }
+      } catch (_) {
+        setState(() => connected = false);
+      }
+    });
+  }
+
+  void _sendUpdate() {
+    if (!connected) return;
+    _channel.sink.add(jsonEncode({
+      "isOn": power,
+      "brightness": brightness,
+      "colorTemp": colorTemp,
+    }));
+  }
+
+  @override
+  void dispose() {
+    _statusTimer?.cancel();
+    _channel.sink.close();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("LumiFlex Control"),
+        actions: [
+          Icon(
+            connected ? Icons.wifi : Icons.wifi_off,
+            color: connected ? Colors.green : Colors.red,
+          ),
+          const SizedBox(width: 16),
+        ],
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            SwitchListTile(
+              title: const Text("Power"),
+              value: power,
+              onChanged: (v) {
+                setState(() => power = v);
+                _sendUpdate();
+              },
+            ),
+            const SizedBox(height: 20),
+            const Text("Brightness"),
+            Slider(
+              value: brightness,
+              min: 0,
+              max: 1,
+              onChanged: (v) {
+                setState(() => brightness = v);
+                _sendUpdate();
+              },
+            ),
+            const SizedBox(height: 20),
+            const Text("Color Temperature"),
+            Slider(
+              value: colorTemp,
+              min: 0,
+              max: 1,
+              onChanged: (v) {
+                setState(() => colorTemp = v);
+                _sendUpdate();
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ================= WIFI SETUP PAGE =================
+class WifiSetupPage extends StatefulWidget {
+  const WifiSetupPage({super.key});
+
+  @override
+  State<WifiSetupPage> createState() => _WifiSetupPageState();
+}
+
+class _WifiSetupPageState extends State<WifiSetupPage> {
+  final ssidCtrl = TextEditingController();
+  final passCtrl = TextEditingController();
+  bool loading = false;
+
+  Future<void> _submit() async {
+    setState(() => loading = true);
+
+    try {
+      await http.post(
+        Uri.http(espHost, "/connect"),
+        headers: {"Content-Type": "application/json"},
+        body: jsonEncode({
+          "ssid": ssidCtrl.text,
+          "password": passCtrl.text,
+        }),
+      );
+    } catch (_) {}
+
+    setState(() => loading = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text("Wi-Fi Setup")),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            TextField(
+              controller: ssidCtrl,
+              decoration: const InputDecoration(labelText: "SSID"),
+            ),
+            TextField(
+              controller: passCtrl,
+              decoration: const InputDecoration(labelText: "Password"),
+              obscureText: true,
+            ),
+            const SizedBox(height: 20),
+            ElevatedButton(
+              onPressed: loading ? null : _submit,
+              child: loading
+                  ? const CircularProgressIndicator()
+                  : const Text("Connect"),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
