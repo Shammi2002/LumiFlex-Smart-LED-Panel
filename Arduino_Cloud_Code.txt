@@ -1,0 +1,269 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include <ESPmDNS.h>
+
+// SoftAP credentials
+const char* apSSID = "ESP32_WiFi";
+const char* apPASS = "LumiFlex";
+
+// Preferences
+Preferences prefs;
+
+// Servers
+WebServer configServer(80);  
+AsyncWebServer ledServer(8080);  
+AsyncWebSocket ws("/ws");
+
+// LED pins
+const int warmPin = 14;
+const int coolPin = 15;
+
+// PWM setup
+const int freq = 5000;
+const int resolution = 8;
+const int warmChannel = 0;
+const int coolChannel = 1;
+
+// LED state
+bool powerOn = true;
+float colorTemp = 0.5;
+float brightness = 1.0;
+
+// MEMORY SAVING VARIABLES
+unsigned long lastChangeTime = 0;
+bool settingsChanged = false;
+
+// ================= LED CONTROL =================
+void updateLEDs() {
+  if (!powerOn) {
+    ledcWrite(warmChannel, 255);
+    ledcWrite(coolChannel, 255);
+    Serial.println(" [POWER] OFF (Standby)");
+    return;
+  }
+
+  float warmRatio = colorTemp;
+  float coolRatio = 1.0 - colorTemp;
+  int warmValue = 255 - int(warmRatio * brightness * 255.0);
+  int coolValue = 255 - int(coolRatio * brightness * 255.0);
+
+  ledcWrite(warmChannel, warmValue);
+  ledcWrite(coolChannel, coolValue);
+
+  Serial.print(" [ACTION] ON -> W: "); Serial.print(warmValue);
+  Serial.print(" | C: "); Serial.println(coolValue);
+}
+
+void saveSettings() {
+  Serial.println(">> [MEMORY] Saving settings...");
+  prefs.begin("leds", false);
+  prefs.putFloat("ct", colorTemp);
+  prefs.putFloat("bri", brightness);
+  prefs.putBool("pwr", powerOn);
+  prefs.end();
+  Serial.println(">> [MEMORY] Saved!");
+}
+
+// ================= WebSocket =================
+void onWebSocketMessage(void *arg, uint8_t *data, size_t len) {
+  AwsFrameInfo *info = (AwsFrameInfo*)arg;
+  if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+    data[len] = 0;
+    StaticJsonDocument<200> doc;
+    if (!deserializeJson(doc, data)) {
+      bool changed = false;
+
+      if (doc.containsKey("isOn")) {
+        bool newPower = doc["isOn"];
+        if (powerOn != newPower) { powerOn = newPower; changed = true; }
+      }
+
+      if (doc.containsKey("colorTemp")) {
+        float newCT = constrain(doc["colorTemp"].as<float>(), 0.0, 1.0);
+        if (abs(newCT - colorTemp) > 0.01) { colorTemp = newCT; changed = true; }
+      }
+
+      if (doc.containsKey("brightness")) {
+        float newBri = constrain(doc["brightness"].as<float>(), 0.1, 1.0);
+        if (abs(newBri - brightness) > 0.01) { brightness = newBri; changed = true; }
+      }
+
+      if (changed) {
+        updateLEDs();
+        settingsChanged = true;
+        lastChangeTime = millis();
+      }
+    }
+  }
+}
+
+void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
+             AwsEventType type, void *arg, uint8_t *data, size_t len) {
+  if (type == WS_EVT_CONNECT) {
+    Serial.println(" [WS] Client Connected!");
+    String msg = "{\"brightness\":" + String(brightness) + 
+                 ",\"colorTemp\":" + String(colorTemp) + 
+                 ",\"isOn\":" + (powerOn ? "true" : "false") + "}";
+    client->text(msg);
+  }
+  else if (type == WS_EVT_DATA) { onWebSocketMessage(arg, data, len); }
+}
+
+// ================= WiFi Config =================
+void handleScan() {
+  int n = WiFi.scanNetworks(false, false, false, 300);
+  StaticJsonDocument<2048> doc;
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < n; i++) {
+    JsonObject obj = arr.createNestedObject();
+    obj["ssid"] = WiFi.SSID(i);
+    obj["rssi"] = WiFi.RSSI(i);
+    obj["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+  }
+  String out; serializeJson(arr, out);
+  configServer.sendHeader("Access-Control-Allow-Origin", "*");
+  configServer.send(200, "application/json", out);
+}
+
+void handleConnect() {
+  if (!configServer.hasArg("plain")) { configServer.send(400, "text/plain", "Missing body"); return; }
+  String body = configServer.arg("plain");
+  StaticJsonDocument<200> doc;
+  if (deserializeJson(doc, body)) { configServer.send(400, "text/plain", "Bad JSON"); return; }
+
+  const char* ssid = doc["ssid"];
+  const char* pass = doc["password"];
+
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", pass);
+  prefs.end();
+
+  configServer.sendHeader("Access-Control-Allow-Origin", "*");
+  configServer.send(200, "text/plain", "OK");
+  delay(1000);
+  ESP.restart();
+}
+
+void handleStatus() {
+  StaticJsonDocument<256> doc;
+  doc["status"] = "online";
+  doc["mode"] = WiFi.getMode() == WIFI_AP ? "AP" : "STA";
+  doc["ip"] = WiFi.localIP().toString();
+  doc["rssi"] = WiFi.RSSI();
+  String out; serializeJson(doc, out);
+  configServer.sendHeader("Access-Control-Allow-Origin", "*");
+  configServer.send(200, "application/json", out);
+}
+
+void handleReset() {
+  prefs.begin("wifi", false); prefs.clear(); prefs.end();
+  prefs.begin("leds", false); prefs.clear(); prefs.end();
+  configServer.sendHeader("Access-Control-Allow-Origin", "*");
+  configServer.send(200, "text/plain", "Resetting...");
+  delay(1000);
+  ESP.restart();
+}
+
+void handleCORS() {
+  configServer.sendHeader("Access-Control-Allow-Origin", "*");
+  configServer.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  configServer.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  configServer.send(204);
+}
+
+void setupConfigServerRoutes() {
+  configServer.on("/scan", HTTP_GET, handleScan);
+  configServer.on("/connect", HTTP_POST, handleConnect);
+  configServer.on("/status", HTTP_GET, handleStatus);
+  configServer.on("/reset", HTTP_GET, handleReset);
+  configServer.on("/scan", HTTP_OPTIONS, handleCORS);
+  configServer.on("/connect", HTTP_OPTIONS, handleCORS);
+  configServer.on("/status", HTTP_OPTIONS, handleCORS);
+}
+
+// ================= Connect to WiFi =================
+void connectToSavedWiFi() {
+  prefs.begin("wifi", true);
+  String ssid = prefs.getString("ssid", "");
+  String pass = prefs.getString("pass", "");
+  prefs.end();
+
+  if (ssid.length() == 0) return;
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("✓ WiFi Connected! STA IP: ");
+    Serial.println(WiFi.localIP());
+
+    WiFi.softAP(apSSID, apPASS); // keep AP alive
+
+    // ===== mDNS =====
+    if (MDNS.begin("esp32")) {
+      MDNS.addService("http", "tcp", 80);
+      MDNS.addService("ws", "tcp", 8080);
+      Serial.println("mDNS started: http://esp32.local");
+    }
+
+    ws.onEvent(onEvent);
+    ledServer.addHandler(&ws);
+    ledServer.begin();
+    setupConfigServerRoutes();
+    configServer.begin();
+  } else {
+    Serial.println("Using AP Mode only.");
+  }
+}
+
+void startAPMode() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(apSSID, apPASS);
+  setupConfigServerRoutes();
+  configServer.begin();
+  Serial.println("AP Mode Started: " + WiFi.softAPIP().toString());
+}
+
+// ================= Setup & Loop =================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println(">>> STARTUP >>>");
+
+  ledcSetup(warmChannel, freq, resolution);
+  ledcSetup(coolChannel, freq, resolution);
+  ledcAttachPin(warmPin, warmChannel);
+  ledcAttachPin(coolPin, coolChannel);
+
+  prefs.begin("leds", true);
+  colorTemp = prefs.getFloat("ct", 0.5);
+  brightness = prefs.getFloat("bri", 1.0);
+  powerOn = prefs.getBool("pwr", true);
+  prefs.end();
+
+  updateLEDs();
+
+  connectToSavedWiFi();
+  if (WiFi.status() != WL_CONNECTED) startAPMode();
+}
+
+void loop() {
+  configServer.handleClient();
+  ws.cleanupClients();
+  if (settingsChanged && (millis() - lastChangeTime > 2000)) {
+    saveSettings();
+    settingsChanged = false;
+  }
+}
